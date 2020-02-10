@@ -1,4 +1,4 @@
-// +build linux darwin freebsd
+// +build darwin freebsd
 
 package vfsflags
 
