@@ -11,7 +11,7 @@ func init() {
 	registerPolicy("lus", &Lus{})
 }
 
-// Lus stands for most free space
+// Lus stands for least free space
 // Search category: same as eplus.
 // Action category: same as eplus.
 // Create category: Pick the drive with the least used space.
