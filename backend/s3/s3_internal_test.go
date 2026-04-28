@@ -19,6 +19,7 @@ import (
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/cache"
 	"github.com/rclone/rclone/fs/hash"
+	"github.com/rclone/rclone/fs/object"
 	"github.com/rclone/rclone/fstest"
 	"github.com/rclone/rclone/fstest/fstests"
 	"github.com/rclone/rclone/lib/bucket"
@@ -245,6 +246,41 @@ func TestMergeDeleteMarkers(t *testing.T) {
 	} {
 		got := mergeDeleteMarkers(test.versions, test.markers)
 		assert.Equal(t, test.want, got, fmt.Sprintf("%d: %+v", n, test))
+	}
+}
+
+// TestAddListingDelimiter checks that the listing-prefix slash logic
+// correctly descends into "//" empty-name subdirectories, both when
+// listing directly off the bucket root and when there is a non-empty
+// rootDirectory. See https://github.com/rclone/rclone/issues/9383.
+func TestAddListingDelimiter(t *testing.T) {
+	for _, test := range []struct {
+		directory string
+		prefix    string // mimics list()'s prefix after `+= "/"`: either "" or "rootDir/"
+		want      string
+	}{
+		// no rootDirectory
+		{"", "", ""},
+		{"a", "", "a/"},
+		{"a/b", "", "a/b/"},
+		{"a/b/", "", "a/b//"},   // empty-name subdir of "a/b"
+		{"a/b//", "", "a/b///"}, // nested empty-name subdir
+		{"/", "", "/"},          // empty-name subdir of root
+		{"//", "", "//"},        // nested empty-name subdir of root
+
+		// rootDirectory = "test"
+		{"test", "test/", "test/"},
+		{"test/a", "test/", "test/a/"},
+		{"test/a/b", "test/", "test/a/b/"},
+		{"test/a/b/", "test/", "test/a/b//"},   // BUG before fix: produced "test/a/b/"
+		{"test/a/b//", "test/", "test/a/b///"}, // nested empty-name subdir
+		{"test//", "test/", "test//"},          // empty-name subdir of rootDir
+		{"test///", "test/", "test///"},        // nested empty-name subdir of rootDir
+	} {
+		t.Run(fmt.Sprintf("%q,%q", test.directory, test.prefix), func(t *testing.T) {
+			got := addListingDelimiter(test.directory, test.prefix)
+			assert.Equal(t, test.want, got)
+		})
 	}
 }
 
@@ -775,11 +811,89 @@ func (f *Fs) InternalTestObjectLock(t *testing.T) {
 	})
 }
 
+// InternalTestDoubleSlashKeys tests that S3 object keys containing
+// consecutive forward slashes ("//") can be navigated through the
+// per-directory listing path. See https://github.com/rclone/rclone/issues/9383
+//
+// The bug only manifests when the Fs has a non-empty rootDirectory,
+// so this test creates a sub-Fs to exercise that code path.
+//
+// Some S3-compatible servers (notably MinIO) reject "//" in object
+// keys outright. The test skips on those servers.
+func (f *Fs) InternalTestDoubleSlashKeys(t *testing.T) {
+	ctx := context.Background()
+
+	// Upload an object with "//" in its key via the existing f. We do
+	// not need a non-empty rootDirectory to put the object - the bug
+	// is in listing.
+	parent := "ds-" + strings.ToLower(random.String(8))
+	contents := random.String(100)
+	fileName := parent + "/a/b//c.txt"
+	item := fstest.NewItem(fileName, contents, fstest.Time("2001-05-06T04:05:06.499999999Z"))
+	src := object.NewStaticObjectInfo(fileName, item.ModTime, int64(len(contents)), true, nil, nil)
+	obj, err := f.Put(ctx, strings.NewReader(contents), src)
+	if err != nil {
+		var apiErr smithy.APIError
+		if errors.As(err, &apiErr) && apiErr.ErrorCode() == "XMinioInvalidObjectName" {
+			t.Skipf("This S3-compatible server does not allow %q in object keys: %v", "//", err)
+		}
+		t.Fatalf("Put failed: %v", err)
+	}
+	defer func() {
+		assert.NoError(t, obj.Remove(ctx))
+	}()
+
+	// Build a sub-Fs rooted at parent so that rootDirectory != "".
+	subFs, err := cache.Get(ctx, fs.ConfigStringFull(f)+"/"+parent)
+	require.NoError(t, err)
+
+	hasDir := func(entries fs.DirEntries, want string) bool {
+		for _, e := range entries {
+			if _, ok := e.(fs.Directory); ok && e.Remote() == want {
+				return true
+			}
+		}
+		return false
+	}
+	hasObject := func(entries fs.DirEntries, want string) bool {
+		for _, e := range entries {
+			if _, ok := e.(fs.Object); ok && e.Remote() == want {
+				return true
+			}
+		}
+		return false
+	}
+
+	// Each listing step must succeed for a sync/copy to traverse into
+	// the empty-named subdirectory and transfer the object.
+	t.Run("ListRoot", func(t *testing.T) {
+		entries, err := subFs.List(ctx, "")
+		require.NoError(t, err)
+		assert.True(t, hasDir(entries, "a"), "expected directory %q in listing of root, got %v", "a", entries)
+	})
+	t.Run("ListA", func(t *testing.T) {
+		entries, err := subFs.List(ctx, "a")
+		require.NoError(t, err)
+		assert.True(t, hasDir(entries, "a/b"), "expected directory %q in listing of %q, got %v", "a/b", "a", entries)
+	})
+	t.Run("ListAB", func(t *testing.T) {
+		entries, err := subFs.List(ctx, "a/b")
+		require.NoError(t, err)
+		assert.True(t, hasDir(entries, "a/b/"), "expected directory %q (empty-named subdir) in listing of %q, got %v", "a/b/", "a/b", entries)
+	})
+	t.Run("ListABEmptySubdir", func(t *testing.T) {
+		entries, err := subFs.List(ctx, "a/b/")
+		require.NoError(t, err)
+		assert.True(t, hasObject(entries, "a/b//c.txt"), "expected object %q in listing of %q, got %v", "a/b//c.txt", "a/b/", entries)
+	})
+}
+
 func (f *Fs) InternalTest(t *testing.T) {
 	t.Run("Metadata", f.InternalTestMetadata)
 	t.Run("NoHead", f.InternalTestNoHead)
 	t.Run("Versions", f.InternalTestVersions)
 	t.Run("ObjectLock", f.InternalTestObjectLock)
+	t.Run("DoubleSlashKeys", f.InternalTestDoubleSlashKeys)
 }
 
 var _ fstests.InternalTester = (*Fs)(nil)

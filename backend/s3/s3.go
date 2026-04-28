@@ -2341,6 +2341,28 @@ type listFn func(remote string, object *types.Object, versionID *string, isDirec
 // listFn should return it to end the iteration with no errors.
 var errEndList = errors.New("end list")
 
+// addListingDelimiter returns directory with a trailing "/" appended
+// so it can be used as a delimited S3 listing prefix.
+//
+// directory is the bucket-relative path being listed; prefix is the
+// rclone-side rootDirectory with a trailing "/" appended, or "" when
+// no rootDirectory is set. The portion of directory after prefix is
+// the rclone-relative dir: if that portion is all "/" (or empty) the
+// directory already has the trailing slashes needed to descend into
+// an empty-name subdirectory caused by "//" in an object key; otherwise
+// one more "/" is appended.
+//
+// See https://github.com/rclone/rclone/issues/9383.
+func addListingDelimiter(directory, prefix string) string {
+	if directory == "" {
+		return directory
+	}
+	if bucket.IsAllSlashes(strings.TrimPrefix(directory, prefix)) {
+		return directory
+	}
+	return directory + "/"
+}
+
 // list options
 type listOpt struct {
 	bucket        string  // bucket to list
@@ -2363,9 +2385,7 @@ func (f *Fs) list(ctx context.Context, opt listOpt, fn listFn) error {
 		opt.prefix += "/"
 	}
 	if !opt.findFile {
-		if opt.directory != "" && (opt.prefix == "" && !bucket.IsAllSlashes(opt.directory) || opt.prefix != "" && !strings.HasSuffix(opt.directory, "/")) {
-			opt.directory += "/"
-		}
+		opt.directory = addListingDelimiter(opt.directory, opt.prefix)
 	}
 	// Use nil delimiter for recursive listings to omit the parameter
 	// entirely. Some S3-compatible servers reject an empty delimiter.
