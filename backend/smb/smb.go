@@ -171,7 +171,14 @@ type Fs struct {
 	sessions atomic.Int32
 	poolMu   sync.Mutex
 	pool     []*conn
-	drain    *time.Timer // used to drain the pool when we stop using the connections
+	drain    *time.Timer    // used to drain the pool when we stop using the connections
+	live     int            // live connections (pooled + in use), under poolMu
+	ci       *fs.ConfigInfo // for --max-connections, read live so rc options/set applies
+	maxConns int            // limit used when ci is nil (tests), 0 = unlimited
+	connFree chan struct{}  // signalled when a connection is returned or closed
+
+	// dialConn, if set, replaces newConnection (used in tests)
+	dialConn func(ctx context.Context, share string) (*conn, error)
 
 	ctx context.Context
 }
@@ -211,6 +218,8 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	}).Fill(ctx, f)
 
 	f.pacer = fs.NewPacer(ctx, pacer.NewDefault(pacer.MinSleep(minSleep), pacer.MaxSleep(maxSleep), pacer.DecayConstant(decayConstant)))
+	f.ci = fs.GetConfig(ctx)
+	f.connFree = make(chan struct{}, 1)
 	// set the pool drainer timer going
 	if opt.IdleTimeout > 0 {
 		f.drain = time.AfterFunc(time.Duration(opt.IdleTimeout), func() { _ = f.drainPool(ctx) })
@@ -833,6 +842,10 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 		remove()
 		return fmt.Errorf("Update Close failed: %w", err)
 	}
+
+	// Return the connection before SetModTime takes one: holding it
+	// while waiting for another can deadlock at --max-connections.
+	o.fs.putConnection(&cn, nil)
 
 	// Set the modified time and also o.statResult
 	err = o.SetModTime(ctx, src.ModTime(ctx))

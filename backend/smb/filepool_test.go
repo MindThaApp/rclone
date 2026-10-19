@@ -41,6 +41,10 @@ func (m *mockFs) getConnection(ctx context.Context, share string) (*conn, error)
 	return &conn{}, nil
 }
 
+func (m *mockFs) getConnectionWake(ctx context.Context, share string, wake <-chan struct{}) (*conn, error) {
+	return m.getConnection(ctx, share)
+}
+
 func (m *mockFs) removeSession() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
