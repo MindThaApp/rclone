@@ -2,6 +2,7 @@ package smb
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"sync"
@@ -13,6 +14,7 @@ import (
 // FsInterface defines the methods that filePool needs from Fs
 type FsInterface interface {
 	getConnection(ctx context.Context, share string) (*conn, error)
+	getConnectionWake(ctx context.Context, share string, wake <-chan struct{}) (*conn, error)
 	putConnection(pc **conn, err error)
 	removeSession()
 }
@@ -28,8 +30,9 @@ type filePool struct {
 	share string
 	path  string
 
-	mu   sync.Mutex
-	pool []*file
+	mu    sync.Mutex
+	pool  []*file
+	avail chan struct{} // signalled when a file is put back in the pool
 }
 
 func newFilePool(ctx context.Context, fs FsInterface, share, path string) *filePool {
@@ -38,31 +41,40 @@ func newFilePool(ctx context.Context, fs FsInterface, share, path string) *fileP
 		fs:    fs,
 		share: share,
 		path:  path,
+		avail: make(chan struct{}, 1),
 	}
 }
 
 func (p *filePool) get() (*file, error) {
-	p.mu.Lock()
-	if len(p.pool) > 0 {
-		f := p.pool[len(p.pool)-1]
-		p.pool = p.pool[:len(p.pool)-1]
+	for {
+		p.mu.Lock()
+		if len(p.pool) > 0 {
+			f := p.pool[len(p.pool)-1]
+			p.pool = p.pool[:len(p.pool)-1]
+			p.mu.Unlock()
+			return f, nil
+		}
 		p.mu.Unlock()
-		return f, nil
-	}
-	p.mu.Unlock()
 
-	c, err := p.fs.getConnection(p.ctx, p.share)
-	if err != nil {
-		return nil, err
-	}
+		// The other writers of this file may hold all the connections
+		// allowed by --max-connections, so stop waiting for a new one
+		// when one of their handles comes back to this pool.
+		c, err := p.fs.getConnectionWake(p.ctx, p.share, p.avail)
+		if errors.Is(err, errConnWoken) {
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
 
-	fl, err := c.smbShare.OpenFile(p.path, os.O_WRONLY, 0o644)
-	if err != nil {
-		p.fs.putConnection(&c, err)
-		return nil, fmt.Errorf("failed to open: %w", err)
-	}
+		fl, err := c.smbShare.OpenFile(p.path, os.O_WRONLY, 0o644)
+		if err != nil {
+			p.fs.putConnection(&c, err)
+			return nil, fmt.Errorf("failed to open: %w", err)
+		}
 
-	return &file{File: fl, c: c}, nil
+		return &file{File: fl, c: c}, nil
+	}
 }
 
 func (p *filePool) put(f *file, err error) {
@@ -79,6 +91,10 @@ func (p *filePool) put(f *file, err error) {
 	p.mu.Lock()
 	p.pool = append(p.pool, f)
 	p.mu.Unlock()
+	select {
+	case p.avail <- struct{}{}:
+	default:
+	}
 }
 
 func (p *filePool) drain() error {
